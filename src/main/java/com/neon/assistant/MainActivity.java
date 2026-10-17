@@ -39,24 +39,32 @@ import org.json.JSONArray;
 import org.json.JSONObject;
 
 import java.io.ByteArrayOutputStream;
+import java.io.File;
+import java.io.FileInputStream;
+import java.io.FileOutputStream;
+import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.net.HttpURLConnection;
 import java.net.URL;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Locale;
+import java.util.zip.ZipEntry;
+import java.util.zip.ZipInputStream;
 
-import ai.picovoice.porcupine.Porcupine;
-import ai.picovoice.porcupine.PorcupineManager;
+import org.vosk.Model;
+import org.vosk.Recognizer;
 
 public class MainActivity extends Activity {
 
     // ---------------------------------------------------------------- state
     static final int S_SETUP = 0, S_IDLE = 1, S_LISTEN = 2, S_THINK = 3, S_SPEAK = 4, S_ERROR = 5;
 
-    static final String[] WAKE_WORDS = {"HEY_GOOGLE", "OK_GOOGLE", "JARVIS", "COMPUTER", "PICOVOICE", "TERMINATOR"};
+    static final String[] WAKE_WORDS = {"hey google", "ok google", "hey computer"};
+    static final String MODEL_URL = "https://alphacephei.com/vosk/models/vosk-model-small-en-us-0.15.zip";
     static final String[] MODELS = {"gemini-3.5-flash-lite", "gemini-3.8-flash", "gemini-3.6-flash"};
 
     static final String SYSTEM_PROMPT =
@@ -65,6 +73,7 @@ public class MainActivity extends Activity {
             + "Understand the audio and answer in the SAME language the user spoke. "
             + "Keep answers short and natural for speaking aloud: one to three sentences. "
             + "Never use markdown, lists, symbols or emojis. "
+            + "The audio may begin with the wake phrase (for example 'hey google'); ignore it and answer what follows. "
             + "If the audio is silent or unintelligible, set heard to an empty string and reply briefly asking to repeat. "
             + "Return ONLY a JSON object: {\"heard\":\"what the user said\",\"reply\":\"your spoken answer\",\"lang\":\"ar or en\"}.";
 
@@ -75,11 +84,13 @@ public class MainActivity extends Activity {
     NeonView neon;
     TextView statusView, textView, gearView;
 
-    PorcupineManager porcupine;
-    boolean porcupineRunning = false;
+    Model voskModel;
+    volatile boolean loadingModel = false;
+    boolean modelFailed = false;
+    boolean resumed = false;
 
-    volatile boolean cancelRecording = false;
-    Thread recordThread;
+    volatile int micToken = 0;
+    Thread micThread;
     volatile float level = 0f;
 
     TextToSpeech tts;
@@ -100,7 +111,7 @@ public class MainActivity extends Activity {
         } else {
             requestPermissions(new String[]{Manifest.permission.RECORD_AUDIO}, 7);
         }
-        if (prefs.getString("gemini", "").length() == 0 || prefs.getString("pico", "").length() == 0) {
+        if (prefs.getString("gemini", "").length() == 0) {
             showSettings();
         }
     }
@@ -123,6 +134,7 @@ public class MainActivity extends Activity {
     @Override
     protected void onResume() {
         super.onResume();
+        resumed = true;
         goImmersive();
         if (checkSelfPermissionCompat() && state != S_THINK && state != S_SPEAK && state != S_LISTEN) {
             startWake();
@@ -132,15 +144,23 @@ public class MainActivity extends Activity {
     @Override
     protected void onPause() {
         super.onPause();
-        cancelRecording = true;
-        stopWake();
+        resumed = false;
+        stopMic();
         if (tts != null) tts.stop();
+        if (state == S_LISTEN || state == S_IDLE || state == S_SPEAK) state = S_SETUP;
     }
 
     @Override
     protected void onDestroy() {
         super.onDestroy();
-        deleteWake();
+        stopMic();
+        if (voskModel != null) {
+            try {
+                voskModel.close();
+            } catch (Throwable ignored) {
+            }
+            voskModel = null;
+        }
         if (tts != null) {
             tts.shutdown();
             tts = null;
@@ -200,7 +220,7 @@ public class MainActivity extends Activity {
         root.addView(col, clp);
 
         gearView = new TextView(this);
-        gearView.setText("\u2699");
+        gearView.setText("⚙");
         gearView.setTextSize(26);
         gearView.setTextColor(Color.argb(150, 0, 240, 255));
         gearView.setPadding((int) (16 * d), (int) (12 * d), (int) (16 * d), (int) (12 * d));
@@ -219,23 +239,37 @@ public class MainActivity extends Activity {
             }
         });
 
+        neon.setOnLongClickListener(new View.OnLongClickListener() {
+            public boolean onLongClick(View v) {
+                if ((state == S_IDLE || state == S_ERROR || state == S_SETUP) && checkSelfPermissionCompat()) {
+                    beginListen(true);
+                }
+                return true;
+            }
+        });
+
         setContentView(root);
         setStatus(S_SETUP, "جاري التجهيز...", null);
     }
 
     void onTap() {
         if (state == S_IDLE || state == S_ERROR || state == S_SETUP) {
+            if (modelFailed) {
+                modelFailed = false;
+                ensureModel();
+                return;
+            }
             if (!checkSelfPermissionCompat()) {
                 requestPermissions(new String[]{Manifest.permission.RECORD_AUDIO}, 7);
                 return;
             }
-            stopWake();
-            beginListen();
+            beginListen(true);
         } else if (state == S_SPEAK) {
             if (tts != null) tts.stop();
             backToIdle();
         } else if (state == S_LISTEN) {
-            cancelRecording = true;
+            stopMic();
+            backToIdle();
         }
     }
 
@@ -265,7 +299,7 @@ public class MainActivity extends Activity {
         box.setPadding(p, p, p, p);
 
         final EditText gem = field("Gemini API Key", prefs.getString("gemini", ""));
-        final EditText pico = field("Picovoice AccessKey", prefs.getString("pico", ""));
+        final EditText murl = field("Model URL", prefs.getString("modelurl", MODEL_URL));
 
         TextView l1 = new TextView(this);
         l1.setText("Model");
@@ -282,11 +316,14 @@ public class MainActivity extends Activity {
         for (int i = 0; i < WAKE_WORDS.length; i++) if (WAKE_WORDS[i].equals(curWake)) wake.setSelection(i);
 
         box.addView(gem);
-        box.addView(pico);
         box.addView(l1);
         box.addView(model);
         box.addView(l2);
         box.addView(wake);
+        TextView l3 = new TextView(this);
+        l3.setText("Wake-word model URL (leave as is)");
+        box.addView(l3);
+        box.addView(murl);
 
         ScrollView sv = new ScrollView(this);
         sv.addView(box);
@@ -298,11 +335,12 @@ public class MainActivity extends Activity {
                     public void onClick(android.content.DialogInterface dlg, int w) {
                         prefs.edit()
                                 .putString("gemini", gem.getText().toString().trim())
-                                .putString("pico", pico.getText().toString().trim())
+                                .putString("modelurl", murl.getText().toString().trim())
                                 .putString("model", MODELS[model.getSelectedItemPosition()])
                                 .putString("wake", WAKE_WORDS[wake.getSelectedItemPosition()])
                                 .apply();
-                        deleteWake();
+                        stopMic();
+                        state = S_SETUP;
                         if (checkSelfPermissionCompat()) startWake();
                     }
                 })
@@ -318,166 +356,289 @@ public class MainActivity extends Activity {
         return e;
     }
 
-    // ---------------------------------------------------------------- wake word
-    String wakeLabel() {
+    // ---------------------------------------------------------------- wake word model
+
+    static void deleteRec(File f) {
+        File[] kids = f.listFiles();
+        if (kids != null) {
+            for (File k : kids) deleteRec(k);
+        }
+        f.delete();
+    }
+
+    static File modelRoot(File dir) {
+        if (new File(dir, "am").exists()) return dir;
+        File[] kids = dir.listFiles();
+        if (kids != null) {
+            for (File k : kids) {
+                if (k.isDirectory() && new File(k, "am").exists()) return k;
+            }
+        }
+        return null;
+    }
+
+    void ensureModel() {
+        if (voskModel != null || loadingModel) return;
+        loadingModel = true;
+        setStatus(S_SETUP, "جاري تجهيز نموذج الصوت...", null);
+        new Thread(new Runnable() {
+            public void run() {
+                try {
+                    File dir = new File(getFilesDir(), "vosk-model");
+                    File marker = new File(dir, "ready.txt");
+                    if (!marker.exists() || modelRoot(dir) == null) {
+                        downloadModel(prefs.getString("modelurl", MODEL_URL), dir);
+                    }
+                    File root = modelRoot(dir);
+                    if (root == null) throw new IOException("model folder not found");
+                    Model m = new Model(root.getAbsolutePath());
+                    voskModel = m;
+                    ui.post(new Runnable() {
+                        public void run() {
+                            if (resumed) startWake();
+                        }
+                    });
+                } catch (final Throwable t) {
+                    modelFailed = true;
+                    ui.post(new Runnable() {
+                        public void run() {
+                            setStatus(S_ERROR, "فشل تجهيز نموذج الصوت: " + t.getMessage()
+                                    + "\nالمس الشاشة لإعادة المحاولة", null);
+                        }
+                    });
+                } finally {
+                    loadingModel = false;
+                }
+            }
+        }).start();
+    }
+
+    void downloadModel(String urlStr, File dir) throws Exception {
+        deleteRec(dir);
+        dir.mkdirs();
+        File zip = new File(getCacheDir(), "model.zip");
+        HttpURLConnection c = (HttpURLConnection) new URL(urlStr).openConnection();
+        c.setConnectTimeout(20000);
+        c.setReadTimeout(30000);
+        c.setInstanceFollowRedirects(true);
+        int code = c.getResponseCode();
+        if (code != 200) throw new IOException("HTTP " + code);
+        long total = c.getContentLength();
+        InputStream in = c.getInputStream();
+        FileOutputStream out = new FileOutputStream(zip);
+        byte[] b = new byte[65536];
+        long done = 0;
+        int n, lastPct = -1;
+        while ((n = in.read(b)) > 0) {
+            out.write(b, 0, n);
+            done += n;
+            if (total > 0) {
+                final int pct = (int) (done * 100 / total);
+                if (pct != lastPct && pct % 2 == 0) {
+                    lastPct = pct;
+                    ui.post(new Runnable() {
+                        public void run() {
+                            setStatus(S_SETUP, "تنزيل نموذج الصوت (مرة وحدة) " + pct + "%", null);
+                        }
+                    });
+                }
+            }
+        }
+        out.close();
+        in.close();
+        ui.post(new Runnable() {
+            public void run() {
+                setStatus(S_SETUP, "فك الضغط...", null);
+            }
+        });
+        ZipInputStream zi = new ZipInputStream(new FileInputStream(zip));
+        String base = dir.getCanonicalPath() + File.separator;
+        ZipEntry e;
+        while ((e = zi.getNextEntry()) != null) {
+            File f = new File(dir, e.getName());
+            if (!f.getCanonicalPath().startsWith(base)) throw new IOException("bad zip entry");
+            if (e.isDirectory()) {
+                f.mkdirs();
+            } else {
+                f.getParentFile().mkdirs();
+                FileOutputStream fo = new FileOutputStream(f);
+                int r;
+                while ((r = zi.read(b)) > 0) fo.write(b, 0, r);
+                fo.close();
+            }
+        }
+        zi.close();
+        zip.delete();
+        FileOutputStream mk = new FileOutputStream(new File(dir, "ready.txt"));
+        mk.write('1');
+        mk.close();
+    }
+
+    // ---------------------------------------------------------------- wake word + recording
+
+    String wakePhrase() {
         String w = prefs.getString("wake", WAKE_WORDS[0]);
-        return w.replace('_', ' ').toLowerCase(Locale.US);
+        for (String x : WAKE_WORDS) if (x.equals(w)) return x;
+        return WAKE_WORDS[0];
     }
 
     void startWake() {
         if (state == S_THINK || state == S_SPEAK || state == S_LISTEN) return;
-        String pico = prefs.getString("pico", "");
-        if (pico.length() == 0) {
-            setStatus(S_SETUP, "أدخل مفتاح Picovoice من الإعدادات ⚙", null);
+        if (!resumed || !checkSelfPermissionCompat()) return;
+        if (voskModel == null) {
+            ensureModel();
             return;
         }
-        if (porcupine == null) {
+        if (micThread != null && micThread.isAlive() && state == S_IDLE) return;
+        stopMic();
+        beginMic(false);
+    }
+
+    void stopMic() {
+        micToken++;
+        Thread t = micThread;
+        if (t != null && t != Thread.currentThread()) {
             try {
-                Porcupine.BuiltInKeyword kw = Porcupine.BuiltInKeyword.valueOf(prefs.getString("wake", WAKE_WORDS[0]));
-                porcupine = new PorcupineManager.Builder()
-                        .setAccessKey(pico)
-                        .setKeyword(kw)
-                        .build(getApplicationContext(), new ai.picovoice.porcupine.PorcupineManagerCallback() {
-                            public void invoke(int keywordIndex) {
-                                ui.post(new Runnable() {
-                                    public void run() {
-                                        onWakeWord();
-                                    }
-                                });
-                            }
-                        });
-            } catch (Throwable t) {
-                porcupine = null;
-                setStatus(S_ERROR, "خطأ Picovoice: " + t.getMessage() + "\nاضغط الشاشة للتحدث يدوياً", null);
-                return;
+                t.join(1200);
+            } catch (InterruptedException ignored) {
             }
-        }
-        try {
-            if (!porcupineRunning) {
-                porcupine.start();
-                porcupineRunning = true;
-            }
-            setStatus(S_IDLE, "قل \"" + wakeLabel() + "\" أو المس الشاشة", null);
-        } catch (Throwable t) {
-            porcupineRunning = false;
-            setStatus(S_ERROR, "تعذر تشغيل الميكروفون: " + t.getMessage(), null);
         }
     }
 
-    void stopWake() {
-        if (porcupine != null && porcupineRunning) {
-            try {
-                porcupine.stop();
-            } catch (Throwable ignored) {
-            }
-        }
-        porcupineRunning = false;
-    }
-
-    void deleteWake() {
-        stopWake();
-        if (porcupine != null) {
-            try {
-                porcupine.delete();
-            } catch (Throwable ignored) {
-            }
-            porcupine = null;
-        }
-    }
-
-    void onWakeWord() {
-        if (state != S_IDLE) return;
-        stopWake();
-        beginListen();
-    }
-
-    // ---------------------------------------------------------------- recording
-    void beginListen() {
+    void beginListen(boolean manual) {
         if (prefs.getString("gemini", "").length() == 0) {
             setStatus(S_ERROR, "أدخل مفتاح Gemini من الإعدادات ⚙", null);
             return;
         }
-        cancelRecording = false;
-        level = 0f;
-        setStatus(S_LISTEN, "أسمعك...", null);
-        recordThread = new Thread(new Runnable() {
-            public void run() {
-                recordLoop();
-            }
-        });
-        recordThread.start();
+        stopMic();
+        beginMic(manual);
     }
 
-    void recordLoop() {
+    void beginMic(final boolean manual) {
+        level = 0f;
+        if (manual) {
+            setStatus(S_LISTEN, "أسمعك...", null);
+        } else {
+            setStatus(S_IDLE, "قل \"" + wakePhrase() + "\" أو المس الشاشة", null);
+        }
+        final int token = ++micToken;
+        micThread = new Thread(new Runnable() {
+            public void run() {
+                micLoop(token, manual);
+            }
+        });
+        micThread.start();
+    }
+
+    void micLoop(final int token, boolean manual) {
         final int rate = 16000;
         int minBuf = AudioRecord.getMinBufferSize(rate, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT);
         int bufSize = Math.max(minBuf, rate * 2);
         AudioRecord rec = null;
+        Recognizer rz = null;
         ByteArrayOutputStream pcm = new ByteArrayOutputStream();
+        ArrayDeque<byte[]> pre = new ArrayDeque<byte[]>();
+        boolean cmd = manual;
         boolean gotSpeech = false;
+        boolean captured = false;
+        int speechChunks = 0, silentAfter = 0, total = 0;
+        double noise = 300;
+        double threshold = 900;
+        long lastWake = 0;
+        String phrase = wakePhrase();
+        String key = phrase.substring(phrase.lastIndexOf(' ') + 1);
         try {
             rec = new AudioRecord(MediaRecorder.AudioSource.MIC, rate, AudioFormat.CHANNEL_IN_MONO,
                     AudioFormat.ENCODING_PCM_16BIT, bufSize);
             if (rec.getState() != AudioRecord.STATE_INITIALIZED) {
                 throw new RuntimeException("AudioRecord init failed");
             }
+            if (!manual) {
+                String grammar = new JSONArray().put(phrase).put("[unk]").toString();
+                rz = new Recognizer(voskModel, rate, grammar);
+            }
             rec.startRecording();
 
-            int chunk = rate / 10; // 100 ms
-            short[] buf = new short[chunk];
-            double noise = 0;
-            int calib = 0;
-            double threshold = 900;
-            int speechChunks = 0;
-            int silentAfter = 0;
-            int total = 0;
-
-            while (!cancelRecording) {
-                int n = rec.read(buf, 0, chunk);
+            short[] buf = new short[rate / 10]; // 100 ms
+            while (token == micToken) {
+                int n = rec.read(buf, 0, buf.length);
                 if (n <= 0) continue;
                 double sum = 0;
+                byte[] bytes = new byte[n * 2];
                 for (int i = 0; i < n; i++) {
                     sum += (double) buf[i] * buf[i];
-                    pcm.write(buf[i] & 0xff);
-                    pcm.write((buf[i] >> 8) & 0xff);
+                    bytes[2 * i] = (byte) (buf[i] & 0xff);
+                    bytes[2 * i + 1] = (byte) ((buf[i] >> 8) & 0xff);
                 }
                 double rms = Math.sqrt(sum / n);
-                float lv = (float) Math.min(1.0, rms / 6000.0);
-                level = level * 0.5f + lv * 0.5f;
-                total++;
+                level = level * 0.5f + (float) Math.min(1.0, rms / 6000.0) * 0.5f;
 
-                if (calib < 3) {
-                    noise += rms;
-                    calib++;
-                    if (calib == 3) {
-                        noise /= 3;
-                        threshold = Math.max(noise * 2.5, 700);
+                if (!cmd) {
+                    if (rms < noise * 2) noise = Math.max(150, noise * 0.97 + rms * 0.03);
+                    pre.addLast(bytes);
+                    while (pre.size() > 8) pre.removeFirst();
+                    boolean end = rz.acceptWaveForm(buf, n);
+                    String j = end ? rz.getResult() : rz.getPartialResult();
+                    String heard = "";
+                    try {
+                        JSONObject o = new JSONObject(j);
+                        heard = o.optString("partial", o.optString("text", ""));
+                    } catch (Throwable ignored) {
                     }
-                    continue;
+                    long now = System.currentTimeMillis();
+                    if (heard.contains(key) && now - lastWake > 1500) {
+                        lastWake = now;
+                        for (byte[] c : pre) pcm.write(c, 0, c.length);
+                        pre.clear();
+                        threshold = Math.max(noise * 2.5, 700);
+                        cmd = true;
+                        total = 0;
+                        ui.post(new Runnable() {
+                            public void run() {
+                                if (token == micToken) setStatus(S_LISTEN, "أسمعك...", null);
+                            }
+                        });
+                    }
+                } else {
+                    if (manual && total < 3) {
+                        // calibrate on the first 300 ms of a manual start
+                        noise = noise * 0.5 + rms * 0.5;
+                        threshold = Math.max(noise * 2.5, 700);
+                        pcm.write(bytes, 0, bytes.length);
+                        total++;
+                        continue;
+                    }
+                    pcm.write(bytes, 0, bytes.length);
+                    total++;
+                    if (rms > threshold) {
+                        speechChunks++;
+                        silentAfter = 0;
+                        if (speechChunks >= 2) gotSpeech = true;
+                    } else if (gotSpeech) {
+                        silentAfter++;
+                    }
+                    if (gotSpeech && silentAfter >= 13) {   // ~1.3 s of silence after speech
+                        captured = true;
+                        break;
+                    }
+                    if (!gotSpeech && total >= 70) break;     // 7 s of nothing
+                    if (total >= 170) {                       // 17 s max
+                        captured = gotSpeech;
+                        break;
+                    }
                 }
-
-                if (rms > threshold) {
-                    speechChunks++;
-                    silentAfter = 0;
-                    if (speechChunks >= 2) gotSpeech = true;
-                } else if (gotSpeech) {
-                    silentAfter++;
-                }
-
-                if (gotSpeech && silentAfter >= 13) break;      // ~1.3 s of silence after speech
-                if (!gotSpeech && total >= 70) break;           // 7 s of nothing
-                if (total >= 170) break;                        // 17 s max
             }
         } catch (Throwable t) {
             final String msg = String.valueOf(t.getMessage());
             ui.post(new Runnable() {
                 public void run() {
-                    setStatus(S_ERROR, "خطأ تسجيل: " + msg, null);
+                    if (token != micToken) return;
+                    setStatus(S_ERROR, "خطأ ميكروفون: " + msg, null);
                     ui.postDelayed(new Runnable() {
                         public void run() {
-                            if (state == S_ERROR) startWake();
+                            if (state == S_ERROR && resumed) startWake();
                         }
-                    }, 3000);
+                    }, 4000);
                 }
             });
             return;
@@ -489,13 +650,21 @@ public class MainActivity extends Activity {
                 }
                 rec.release();
             }
+            if (rz != null) {
+                try {
+                    rz.close();
+                } catch (Throwable ignored) {
+                }
+            }
         }
 
         level = 0f;
-        final boolean ok = gotSpeech && !cancelRecording;
+        final boolean ok = captured && token == micToken;
+        final boolean stale = token != micToken;
         final byte[] data = pcm.toByteArray();
         ui.post(new Runnable() {
             public void run() {
+                if (stale) return;
                 if (!ok) {
                     backToIdle();
                     return;
@@ -737,7 +906,7 @@ public class MainActivity extends Activity {
 
     void backToIdle() {
         state = S_SETUP;
-        startWake();
+        if (resumed) startWake();
     }
 
     // ---------------------------------------------------------------- neon view
